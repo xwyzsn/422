@@ -5,6 +5,8 @@ from einops import rearrange,repeat
 import torch.nn.functional as F
 from torch.optim import SGD,Adam
 import math
+
+from torch.optim.optimizer import Optimizer
 from data import tokenizer
 from torch.utils.data import Dataset,DataLoader
 from torch.utils.data import random_split
@@ -13,7 +15,6 @@ from data import CustomDataset
 import os 
 os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 class LinearAttention(nn.Module):
-
     def __init__(self,dim:int,embed_size:int,head:int):
         super().__init__()
         self.embed_size = embed_size
@@ -25,7 +26,7 @@ class LinearAttention(nn.Module):
         self.to_k = nn.Linear(dim,embed_size)
         self.to_v = nn.Linear(dim,embed_size)
         self.to_out = nn.Linear(embed_size,embed_size)
-    
+
     def forward(self,q,k,v,mask=None):
         q = self.to_q(q) # q: batch_size,seq_len,embed_size
         k = self.to_k(k) # k: batch_size,seq_len,embed_size
@@ -33,15 +34,16 @@ class LinearAttention(nn.Module):
         # q k 
         q,k ,v = map(lambda x: rearrange(x,'b s (h e) -> b h s e',h=self.head,e=self.head_dim),[q,k,v])
         energy = einsum('b h s e, b h k e->b h s k',q,k) 
-        energy = self.scale * energy # batch,head,seq_len,embed_size
+        energy = self.scale * energy # batch,head,seq_len,key_len
         if mask is not None:
             tri_mask,padding_mask = mask
             padding_mask = ~padding_mask
-            padding_mask = repeat(padding_mask,'b s -> b h s 1',h=self.head)
-            energy.masked_fill_(padding_mask.bool(),1e-9) # b h seq_len seq_len
+            padding_mask = repeat(padding_mask,'b s -> b h s k',h=self.head,k=energy.size(2)) # batch,head,seq_len
+            padding_mask = rearrange(padding_mask,'b h s k -> b h k s')
+            energy.masked_fill_(padding_mask.bool(),torch.finfo(q.dtype).min) # b h seq_len seq_len
             if tri_mask is not None:
                 tri_mask = ~tri_mask.bool()
-                energy.masked_fill_(tri_mask.bool(),1e-9)
+                energy.masked_fill_(tri_mask.bool(),torch.finfo(q.dtype).min)
         energy = energy.softmax(dim=-1)
         attn = einsum('b h s k,b h k e->b h s e',energy,v)
         out = rearrange(attn,'b h s e -> b s (h e)')
@@ -120,18 +122,25 @@ class PositionalEncoding(nn.Module):
 
 
 
+
+
+
 class Encoder(nn.Module):
 
-    def __init__(self,dim_in,embed_size,head,drop_rate,num):
+    def __init__(self,dim_in,embed_size,head,drop_rate,num,vob_size):
         super().__init__()
         self.net = nn.ModuleList(
             [TransformerBlock(dim_in=dim_in,embed_dim=embed_size,head=head,drop_rate=drop_rate) for _ in range(num)] 
         )
+        self.PE = PositionalEncoding(dim=embed_size)
+        self.embed_size = embed_size
+        self.embed = nn.Embedding(num_embeddings=vob_size,embedding_dim=embed_size,padding_idx=0)
     def forward(self,x,mask=None):
+        input_embed = self.embed(x) * (self.embed_size ** (-0.5))
+        x = self.PE(input_embed) + input_embed
         for idx in range(len(self.net)):
             x = self.net[idx](x,mask)
         return x 
-
 
 class DecoderBlock(nn.Module):
 
@@ -156,12 +165,17 @@ class DecoderBlock(nn.Module):
     
 
 class Decoder(nn.Module):
-    def __init__(self, dim_in,embed_size,head,drop_rate:float=0.1,num:int=3) -> None:
+    def __init__(self, dim_in,embed_size,head,vob_size,drop_rate:float=0.1,num:int=3) -> None:
         super().__init__()
+        self.embed_size = embed_size
         self.net = nn.ModuleList(
             [DecoderBlock(dim_in=dim_in,embed_size=embed_size,head=head,enc_out_dim=embed_size,drop_rate=drop_rate) for _ in range(num) ]
         )
-    def forward(self,x,enc_out,mask=None):
+        self.PE = PositionalEncoding(dim=embed_size)
+        self.embed = nn.Embedding(num_embeddings=vob_size,embedding_dim=embed_size,padding_idx=0)
+    def forward(self,output_ids,enc_out,mask=None):
+        output_embed = self.embed(output_ids) * (self.embed_size ** (-0.5))
+        x = self.PE(output_embed) + output_embed
         for idx in range(len(self.net)):
             x = self.net[idx](x,enc_out,mask)
         return x 
@@ -178,8 +192,8 @@ class Transformer(nn.Module):
                  device:str='cuda'):
         super().__init__()
         self.fc = nn.Linear(embed_size,vocab_size)
-        self.encoder = Encoder(dim_in,embed_size,head,drop_rate=0.1,num=num)
-        self.decoder = Decoder(dim_in=dim_in,embed_size=embed_size,head=head,drop_rate=drop_out)
+        self.encoder = Encoder(dim_in,embed_size,head,drop_rate=0.1,num=num,vob_size=vocab_size)
+        self.decoder = Decoder(dim_in=dim_in,embed_size=embed_size,head=head,drop_rate=drop_out,vob_size=vocab_size,num=num)
         self.PE = PositionalEncoding(dim=embed_size)
         self.embed = nn.Embedding(num_embeddings=vocab_size,embedding_dim=embed_size,padding_idx=0)
         self.device =device
@@ -209,15 +223,13 @@ class Transformer(nn.Module):
 
 
     def forward(self,input_seq,out_seq):
-        input_embed = self.embed(self.get_inputOroutput_ids(input_seq))
-        input_embed = self.PE(input_embed) + input_embed
+        input_ids = self.get_inputOroutput_ids(input_seq)
         out_seq = self.shift_right(out_seq)
-        output_embed = self.embed(self.get_inputOroutput_ids(out_seq))
-        output_embed = self.PE(output_embed) + output_embed
+        output_ids = self.get_inputOroutput_ids(out_seq)
         input_mask = self.make_input_mask(input_seq).bool()
-        enc_out = self.encoder(input_embed,(None,input_mask))
+        enc_out = self.encoder(input_ids,(None,input_mask))
         masks = self.make_output_mask(out_seq).bool()
-        x = self.decoder(output_embed,enc_out,masks)
+        x = self.decoder(output_ids,enc_out,masks)
         out = self.fc(x)
         out = F.softmax(out,dim=-1)
         return out 
@@ -226,7 +238,7 @@ class CrossEntropyLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, input, target, mask=None):
+    def forward(self, input, target, mask=None): # batch,seq_len,pro 
         input = input.view(-1, input.size(-1))
         target = target.view(-1)
 
@@ -248,13 +260,16 @@ class Trainer:
                  ,batch_size,config:dict):
         self.transformer = Transformer(dim_in=dim,vocab_size=vocab_size,head=head,num=num,embed_size=embed_size).to(device=config['device'])
         self.CE = CrossEntropyLoss()
-        self.opt =  Adam(self.transformer.parameters(), betas = (0.9, 0.98),
-                 eps = 1.0e-9,lr=1e-5)
+        self.opt = Adam(self.transformer.parameters(), betas = (0.9, 0.98),
+                 eps = 1.0e-9,lr=1e5) #SGD(self.transformer.parameters(),lr=1.0)  
+                  
         self.dataset = dataset
         train_size = int(0.8 * len(dataset))
         trainset,testset = random_split(self.dataset,[train_size,len(self.dataset)-train_size])
         self.dataloader = DataLoader(self.dataset,batch_size=batch_size,shuffle=True,drop_last=True)
         self.config = config
+        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.opt,max_lr=0.001,epochs=self.config['epoch'],
+                                                                steps_per_epoch=len(self.dataloader),div_factor=100)
 
 
     
@@ -274,6 +289,7 @@ class Trainer:
                 self.opt.zero_grad()
                 loss.backward()
                 self.opt.step()
+                # self.lr_scheduler.step()
                 losses.append(loss.item())
             print(f"{epoch=}  avg loss {np.mean(losses)}")
             self.tranlate_sentence()
@@ -281,16 +297,16 @@ class Trainer:
     
     @torch.no_grad()
     def inference(self,src,tar,max_length=10):
-        input_embed = self.transformer.embed(self.transformer.get_inputOroutput_ids(src))
-        input_embed = self.transformer.PE(input_embed) + input_embed 
+        input_ids= self.transformer.get_inputOroutput_ids(src)
         input_mask = self.transformer.make_input_mask(src).bool()
-        enc_out = self.transformer.encoder(input_embed,(None,input_mask))
+        enc_out = self.transformer.encoder(input_ids,(None,input_mask))
 
         for i in range(1,max_length):
-            output_embed = self.transformer.embed(self.transformer.get_inputOroutput_ids(tar))
-            output_embed = self.transformer.PE(output_embed) + output_embed
+            # output_embed = self.transformer.embed(self.transformer.get_inputOroutput_ids(tar))
+            # output_embed = self.transformer.PE(output_embed) + output_embed
+            output_ids = self.transformer.get_inputOroutput_ids(tar)
             masks = self.transformer.make_output_mask(tar).bool()
-            x = self.transformer.decoder(output_embed,enc_out,masks)
+            x = self.transformer.decoder(output_ids,enc_out,masks)
             out = self.transformer.fc(x)
             out = F.softmax(out,dim=-1)
             max_ids = torch.argmax(out,dim=-1)
@@ -312,7 +328,20 @@ class Trainer:
         return o 
         
 
+class LRSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer,model,warm_steps = 4) -> None:
+        super().__init__(optimizer=optimizer)
+        self.optimizer = optimizer
+        self.model = model 
+        self.warm_steps = warm_steps
 
+    def get_lr(self):
+
+        arg1 = self._step_count ** (-0.5)
+        arg2 = self._step_count * (self.warmup_steps ** -1.5)
+        dynamic_lr = (self.d_model ** (-0.5)) * min(arg1, arg2)
+        
+        return [dynamic_lr for group in self.optimizer.param_groups]
 
 
 if __name__ == '__main__':
@@ -330,7 +359,7 @@ if __name__ == '__main__':
     # out = trans(coding,coding)
     # print(out.shape)
     trainset = CustomDataset()
-    trainer = Trainer(dim=512,vocab_size=trainset.tokenizer.get_vocab_size(),head=4,num=6,embed_size=512,dataset=trainset,\
+    trainer = Trainer(dim=512,vocab_size=trainset.tokenizer.get_vocab_size(),head=8,num=6,embed_size=512,dataset=trainset,\
                       batch_size=128,config={'epoch':200,'device':'cuda'})
     trainer.train()
     # encoding =tokenizer.encode("hello,what's your name")
