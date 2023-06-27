@@ -61,12 +61,12 @@ class CustomDataset(Dataset):
 # tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
 
 # trainer = trainers.WordPieceTrainer(
-#     vocab_size=20000,
+#     vocab_size=30000,
 #     special_tokens = ["<PAD>", "<BOS>", "<EOS>","[UNK]"]
 # )
-path="swaption2009/20k-en-zh-translation-pinyin-hsk"
-dir='./data'
-# dataset = load_dataset(path=path)
+# path="swaption2009/20k-en-zh-translation-pinyin-hsk"
+# dir='./data'
+# dataset = load_dataset(path=path,split='train')
 
 # def extract():
 #     o = []
@@ -89,7 +89,7 @@ tokenizer.post_processor = TemplateProcessing(
         ("<EOS>",tokenizer.token_to_id("<EOS>")),
     )
 )
-# # tokenizer.save('./tmp.json')
-zhs = tokenizer.encode("你好，你叫什么名字")
-print(zhs.ids)
-print(tokenizer.decode(zhs.ids))
+# tokenizer.save('./tmp.json')
+# zhs = tokenizer.encode("你好，你叫什么名字")
+# print(zhs.ids)
+# print(tokenizer.decode(zhs.ids))

@@ -238,17 +238,17 @@ class CrossEntropyLoss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self, input, target, mask=None): # batch,seq_len,pro 
+    def forward(self, input, target, mask=None,ignore_idx=0): # batch,seq_len,pro 
         input = input.view(-1, input.size(-1))
         target = target.view(-1)
 
-        if mask is not None:
-            mask = (mask.view(-1).bool())
-            input = input[mask]
-            target = target[mask]
+        # if mask is not None:
+        #     mask = (mask.view(-1).bool())
+        #     input = input[mask]
+        #     target = target[mask]
 
 
-        loss = F.cross_entropy(input=input,target=target,ignore_index=2)
+        loss = F.cross_entropy(input=input,target=target,ignore_index=ignore_idx,label_smoothing=0.1)
 
         return loss 
 
@@ -258,11 +258,15 @@ class Trainer:
 
     def __init__(self,dim,vocab_size,head,num,embed_size,dataset:Dataset
                  ,batch_size,config:dict):
-        self.transformer = Transformer(dim_in=dim,vocab_size=vocab_size,head=head,num=num,embed_size=embed_size).to(device=config['device'])
+        # self.transformer = Transformer(dim_in=dim,vocab_size=vocab_size,head=head,num=num,embed_size=embed_size).to(device=config['device'])
+        self.transformer = nn.Transformer(device=config['device'],batch_first=True)
+        self.fc = nn.Linear(embed_size,vocab_size).to(config['device'])
+        self
         self.CE = CrossEntropyLoss()
         self.opt = Adam(self.transformer.parameters(), betas = (0.9, 0.98),
-                 eps = 1.0e-9,lr=1e5) #SGD(self.transformer.parameters(),lr=1.0)  
-                  
+                 eps = 1.0e-9,lr=1e-5) #SGD(self.transformer.parameters(),lr=1.0)  
+        self.PE = PositionalEncoding(dim=embed_size).to(config['device'])  
+        self.embed = nn.Embedding(num_embeddings=vocab_size,embedding_dim=embed_size,padding_idx=0).to(config['device'])          
         self.dataset = dataset
         train_size = int(0.8 * len(dataset))
         trainset,testset = random_split(self.dataset,[train_size,len(self.dataset)-train_size])
@@ -270,7 +274,28 @@ class Trainer:
         self.config = config
         self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.opt,max_lr=0.001,epochs=self.config['epoch'],
                                                                 steps_per_epoch=len(self.dataloader),div_factor=100)
+        
 
+    def train_loop(self):
+        for epoch in range(self.config['epoch']):
+            losses = [] 
+            for batch_idx,(src,tar) in enumerate(self.dataloader):
+                input_ids = src.get('ids').to(self.config['device'])
+                mask = src.get('attention_mask').to(self.config['device'])
+                out_ids = tar.get('ids').to(self.config['device'])
+                out_mask = tar.get('attention_mask').to(self.config['device'])
+                src_embed = self.embed(input_ids)
+                src_embed = src_embed + self.PE(src_embed)
+                tar_embed = self.embed(out_ids)
+                tar_embed = tar_embed + self.PE(tar_embed)
+                trg_mask = self.transformer.generate_square_subsequent_mask(input_ids.size(1)).to(device=self.config['device'])
+                out = self.transformer(src_embed,tar_embed,src_key_padding_mask=~mask.bool(),tgt_key_padding_mask=~out_mask.bool(),tgt_mask=trg_mask)
+                out = self.fc(out)
+                loss = self.compute_loss(out,target=out_ids,mask=out_mask)
+                self.opt.zero_grad()
+                loss.backward()
+                losses.append(loss.item())
+            print(f"{epoch=}  avg loss {np.mean(losses)}")
 
     
     def compute_loss(self,input,target,mask=None):
@@ -282,8 +307,8 @@ class Trainer:
             losses = []
             for batch_idx ,(src,tar) in enumerate(self.dataloader):
                 input_ids = tar.get('ids').to(self.config['device'])
-                mask = tar.get('attention_mask').to(self.config['device'])
-                out = self.transformer(src,tar)
+                mask = src.get('attention_mask').to(self.config['device'])
+                out = self.transformer(src,src)
  
                 loss = self.compute_loss(out,target=input_ids,mask=mask)
                 self.opt.zero_grad()
@@ -361,7 +386,7 @@ if __name__ == '__main__':
     trainset = CustomDataset()
     trainer = Trainer(dim=512,vocab_size=trainset.tokenizer.get_vocab_size(),head=8,num=6,embed_size=512,dataset=trainset,\
                       batch_size=128,config={'epoch':200,'device':'cuda'})
-    trainer.train()
+    trainer.train_loop()
     # encoding =tokenizer.encode("hello,what's your name")
     # src = {'attention_mask':torch.tensor(encoding.attention_mask),'ids':torch.tensor(encoding.ids)}
     # tar_enc = tokenizer.encode("<BOS>")
