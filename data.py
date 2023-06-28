@@ -23,7 +23,7 @@ class CustomDataset(Dataset):
         self.tokenizer.enable_padding(pad_id=self.tokenizer.token_to_id("<PAD>"), pad_token="<PAD>", length=16)
         self.tokenizer.enable_truncation(max_length=16)
         self.tokenizer.post_processor = TemplateProcessing(
-            single="$A <EOS>",
+            single="<BOS> $A <EOS>",
             pair="<BOS> $A <EOS> $B:1 <EOS>:1",
             special_tokens=(
                 ("<BOS>", tokenizer.token_to_id("<BOS>")),
@@ -106,7 +106,7 @@ tokenizer = Tokenizer.from_file('./tmp.json')
 tokenizer.enable_padding(pad_id=tokenizer.token_to_id("<PAD>"),pad_token="<PAD>",length=16)
 tokenizer.enable_truncation(max_length=16)
 tokenizer.post_processor = TemplateProcessing(
-    single="$A <EOS>",
+    single="<BOS> $A <EOS>",
     pair="<BOS> $A <EOS> $B:1 <EOS>:1",
     special_tokens=(
         ("<BOS>",tokenizer.token_to_id("<BOS>")),

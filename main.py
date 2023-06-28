@@ -270,11 +270,15 @@ class Model(nn.Module):
     def shift_right(self, ids, mask):
         # ids:batch,seq_len
         # mask : batch ,sen_len
-        start_token = tokenizer.token_to_id('<BOS>')
-        ids[:, -1] = start_token
-        mask[:, -1] = 1
-        ids = torch.roll(ids, 1, -1)
-        mask = torch.roll(mask, 1, -1)
+        # start_token = tokenizer.token_to_id('<BOS>')
+        # ids[:, -1] = start_token
+        # mask[:, -1] = 1
+        # ids = torch.roll(ids, 1, -1)
+        # mask = torch.roll(mask, 1, -1)
+        ids = torch.roll(ids,-1,-1)
+        mask = torch.roll(mask,-1,-1)
+        ids[:,-1] = 0
+        mask[:,-1]=0
         return ids, mask
 
     def forward(self, src, tar):
@@ -282,7 +286,7 @@ class Model(nn.Module):
         mask = src.get('attention_mask').to(self.device)
         out_ids = tar.get('ids').clone().to(self.device)
         out_mask = tar.get('attention_mask').clone().to(self.device)
-        out_ids, out_mask = self.shift_right(out_ids, out_mask)
+        tar_out_ids, tar_out_mask = self.shift_right(out_ids.clone(), out_mask.clone())
         src_embed = self.embed(input_ids)
         src_embed = src_embed + self.PE(src_embed)
         tar_embed = self.embed(out_ids)
@@ -290,8 +294,8 @@ class Model(nn.Module):
         trg_mask = self.transformer.generate_square_subsequent_mask(input_ids.size(1)).to(device=self.device)
         out = self.transformer(src_embed, tar_embed, src_key_padding_mask=~mask.bool(),
                                tgt_key_padding_mask=~out_mask.bool(), tgt_mask=trg_mask)
-        out = F.softmax(self.fc(out), dim=-1)
-        return out, out_ids, out_mask
+        out = self.fc(out)
+        return out, tar_out_ids,tar_out_mask
 
 
 class Trainer:
@@ -318,8 +322,8 @@ class Trainer:
             losses = []
             for batch_idx, (src, tar) in enumerate(self.dataloader):
                 out_ids, out_mask = tar.get('ids').to(self.device), tar.get('attention_mask').to(self.device)
-                out, _, _ = self.model(src, tar)
-                loss = self.compute_loss(out, target=out_ids, mask=out_mask)
+                out, tar_out_ids, tar_out_mask = self.model(src, tar)
+                loss = self.compute_loss(out, target=tar_out_ids, mask=tar_out_mask)
                 self.opt.zero_grad()
                 loss.backward()
                 self.opt.step()
@@ -423,7 +427,7 @@ if __name__ == '__main__':
     trainset = CustomDataset()
     trainer = Trainer(dim=512, vocab_size=trainset.tokenizer.get_vocab_size(), head=8, num=6, embed_size=512,
                       dataset=trainset, \
-                      batch_size=128, config={'epoch': 200, 'device': 'mps'})
+                      batch_size=128, config={'epoch': 200, 'device': 'cpu'})
     trainer.train_loop()
     # encoding =tokenizer.encode("hello,what's your name")
     # src = {'attention_mask':torch.tensor(encoding.attention_mask),'ids':torch.tensor(encoding.ids)}
